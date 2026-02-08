@@ -1338,6 +1338,7 @@ class VllmConfig:
             if self.speculative_config is not None and (
                 self.speculative_config.uses_draft_model()
                 or self.speculative_config.use_eagle()
+                or self.speculative_config.uses_cascade()
             ):
                 multiplier = (
                     self.speculative_config.num_speculative_tokens

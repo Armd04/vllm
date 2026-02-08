@@ -153,6 +153,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.cascade import CascadeProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
@@ -449,6 +450,7 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DraftModelProposer
+                | CascadeProposer
                 | MedusaProposer
             )
             if self.speculative_config.method == "ngram":
@@ -457,6 +459,12 @@ class GPUModelRunner(
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
+            elif self.speculative_config.uses_cascade():
+                self.drafter = CascadeProposer(
                     vllm_config=self.vllm_config,
                     device=self.device,
                     runner=self,
@@ -478,9 +486,18 @@ class GPUModelRunner(
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RejectionSampler(self.sampler)
+            cascade_config = None
+            if self.speculative_config.uses_cascade():
+                cascade_config = {
+                    "deferral_threshold":
+                        self.speculative_config.cascade_deferral_threshold,
+                }
+            self.rejection_sampler = RejectionSampler(
+                self.sampler, cascade_config=cascade_config
+            )
 
         self.num_spec_tokens = 0
+        self._cascade_max_draft_probs: torch.Tensor | None = None
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_config = self.speculative_config.draft_model_config
@@ -2212,6 +2229,25 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
+        # Flatten cascade max_draft_probs to [num_tokens] if available.
+        max_draft_probs = None
+        if (
+            hasattr(self, '_cascade_max_draft_probs')
+            and self._cascade_max_draft_probs is not None
+        ):
+            # self._cascade_max_draft_probs: [batch_size, K]
+            # Flatten to match draft_token_ids ordering
+            # (request-major, variable length).
+            probs_list = []
+            for i, n in enumerate(num_draft_tokens):
+                if n > 0:
+                    probs_list.append(
+                        self._cascade_max_draft_probs[i, :n]
+                    )
+            if probs_list:
+                max_draft_probs = torch.cat(probs_list)
+            self._cascade_max_draft_probs = None
+
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2220,6 +2256,7 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            max_draft_probs=max_draft_probs,
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -3706,12 +3743,18 @@ class GPUModelRunner(
                 <= self.effective_drafter_max_model_len
             )
             use_gpu_toks = (
-                spec_config.use_eagle() or spec_config.uses_draft_model()
+                spec_config.use_eagle()
+                or spec_config.uses_draft_model()
+                or spec_config.uses_cascade()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
-                # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                # EAGLE/DraftModel/Cascade speculative decoding can use the
+                # GPU sampled tokens as inputs, and does not need to wait for
+                # bookkeeping to finish.
+                assert isinstance(
+                    self.drafter,
+                    EagleProposer | DraftModelProposer | CascadeProposer,
+                )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -3990,8 +4033,15 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
                 slot_mappings=slot_mappings,
             )
-        elif spec_config.use_eagle() or spec_config.uses_draft_model():
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+        elif (
+            spec_config.use_eagle()
+            or spec_config.uses_draft_model()
+            or spec_config.uses_cascade()
+        ):
+            assert isinstance(
+                self.drafter,
+                EagleProposer | DraftModelProposer | CascadeProposer,
+            )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4101,6 +4151,10 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+
+            # Store max draft probs for cascade deferral.
+            if isinstance(self.drafter, CascadeProposer):
+                self._cascade_max_draft_probs = self.drafter.max_draft_probs
 
         return draft_token_ids
 
@@ -4879,8 +4933,12 @@ class GPUModelRunner(
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
+                or self.speculative_config.uses_cascade()
             ):
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                assert isinstance(
+                    self.drafter,
+                    EagleProposer | DraftModelProposer | CascadeProposer,
+                )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
                 # Therefore only use cudagraphs if the main model uses PIECEWISE
@@ -6074,8 +6132,12 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
+            or self.speculative_config.uses_cascade()
         ):
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(
+                self.drafter,
+                EagleProposer | DraftModelProposer | CascadeProposer,
+            )
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)

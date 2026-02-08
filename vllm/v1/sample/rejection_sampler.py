@@ -49,12 +49,19 @@ class RejectionSampler(nn.Module):
         output tokens = accepted tokens + recovered tokens + bonus tokens
     """
 
-    def __init__(self, sampler: Sampler):
+    def __init__(
+        self,
+        sampler: Sampler,
+        cascade_config: dict | None = None,
+    ):
         super().__init__()
         self.sampler = sampler
         logprobs_mode = self.sampler.logprobs_mode
         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
         self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
+        self.cascade_enabled = cascade_config is not None
+        if self.cascade_enabled:
+            self.cascade_threshold = cascade_config["deferral_threshold"]
 
     def forward(
         self,
@@ -137,6 +144,15 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
+        # Cascade deferral: compute mask for confident draft positions.
+        cascade_mask = None
+        if self.cascade_enabled and metadata.max_draft_probs is not None:
+            # delta=0 when max_q >= 1-alpha (draft is confident)
+            # For these positions, we want guaranteed acceptance.
+            cascade_mask = (
+                metadata.max_draft_probs >= (1.0 - self.cascade_threshold)
+            )
+
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -146,6 +162,7 @@ class RejectionSampler(nn.Module):
             target_logits,
             bonus_token_ids,
             sampling_metadata,
+            cascade_mask=cascade_mask,
         )
 
         logprobs_tensors = None
@@ -355,6 +372,8 @@ def rejection_sample(
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    # [num_tokens] bool mask: True = auto-accept (cascade deferral)
+    cascade_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -391,6 +410,7 @@ def rejection_sample(
             draft_token_ids,
             target_argmax,
             bonus_token_ids,
+            cascade_mask,
             is_greedy,
             max_spec_len,
         )
@@ -433,6 +453,7 @@ def rejection_sample(
         bonus_token_ids,
         recovered_token_ids,
         uniform_probs,
+        cascade_mask,
         is_greedy,
         max_spec_len,
         vocab_size,
@@ -646,6 +667,7 @@ def rejection_greedy_sample_kernel(
     draft_token_ids_ptr,  # [num_tokens]
     target_argmax_ptr,  # [num_tokens]
     bonus_token_ids_ptr,  # [batch_size]
+    cascade_mask_ptr,  # [num_tokens] bool or None
     is_greedy_ptr,  # [batch_size] or None
     max_spec_len,
 ):
@@ -666,13 +688,25 @@ def rejection_greedy_sample_kernel(
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
             target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
-            tl.store(
-                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
-                target_argmax_id,
-            )
-            if draft_token_id != target_argmax_id:
-                # Reject.
-                rejected = True
+            # Cascade deferral: auto-accept if draft is confident.
+            if cascade_mask_ptr is not None:
+                auto_accept = tl.load(cascade_mask_ptr + start_idx + pos)
+            else:
+                auto_accept = False
+            if auto_accept:
+                # Draft model is confident: accept draft token directly.
+                tl.store(
+                    output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                    draft_token_id,
+                )
+            else:
+                tl.store(
+                    output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                    target_argmax_id,
+                )
+                if draft_token_id != target_argmax_id:
+                    # Reject.
+                    rejected = True
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
@@ -694,6 +728,7 @@ def rejection_random_sample_kernel(
     bonus_token_ids_ptr,  # [batch_size]
     recovered_token_ids_ptr,  # [num_tokens]
     uniform_probs_ptr,  # [num_tokens]
+    cascade_mask_ptr,  # [num_tokens] bool or None
     is_greedy_ptr,  # [batch_size]
     max_spec_len,
     vocab_size,
@@ -713,27 +748,43 @@ def rejection_random_sample_kernel(
     for pos in range(num_draft_tokens):
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-            if NO_DRAFT_PROBS:
-                draft_prob = 1
+            # Cascade deferral: auto-accept if draft is confident.
+            if cascade_mask_ptr is not None:
+                auto_accept = tl.load(cascade_mask_ptr + start_idx + pos)
             else:
-                draft_prob = tl.load(
-                    draft_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
-                )
-            target_prob = tl.load(
-                target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
-            )
-            uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
-            # NOTE(woosuk): While the draft probability should never be 0,
-            # we check it to avoid NaNs. If it happens to be 0, we reject.
-            if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
-                # Accept.
+                auto_accept = False
+            if auto_accept:
+                # Draft model is confident: accept draft token directly.
                 token_id = draft_token_id
             else:
-                # Reject. Use recovered token.
-                rejected = True
-                token_id = tl.load(recovered_token_ids_ptr + start_idx + pos)
+                if NO_DRAFT_PROBS:
+                    draft_prob = 1
+                else:
+                    draft_prob = tl.load(
+                        draft_probs_ptr
+                        + (start_idx + pos) * vocab_size
+                        + draft_token_id
+                    )
+                target_prob = tl.load(
+                    target_probs_ptr
+                    + (start_idx + pos) * vocab_size
+                    + draft_token_id
+                )
+                uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
+                # NOTE(woosuk): While the draft probability should never be 0,
+                # we check it to avoid NaNs. If it happens to be 0, we reject.
+                if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
+                    # Accept.
+                    token_id = draft_token_id
+                else:
+                    # Reject. Use recovered token.
+                    rejected = True
+                    token_id = tl.load(
+                        recovered_token_ids_ptr + start_idx + pos
+                    )
             tl.store(
-                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id
+                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                token_id,
             )
 
     if not rejected:

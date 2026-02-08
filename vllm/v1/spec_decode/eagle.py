@@ -274,6 +274,10 @@ class SpecDecodeBaseProposer:
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(max_batch_size, 1)
 
+    def _sample_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Sample draft token IDs from logits. Subclasses can override."""
+        return logits.argmax(dim=-1)
+
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -498,7 +502,7 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = self._sample_from_logits(logits)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -528,7 +532,7 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = logits.argmax(dim=-1)
+        draft_token_ids = self._sample_from_logits(logits)
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -694,7 +698,7 @@ class SpecDecodeBaseProposer:
 
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = self._sample_from_logits(logits)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
@@ -841,7 +845,7 @@ class SpecDecodeBaseProposer:
             return total_num_output_tokens, token_indices_to_sample, new_cad
 
     def model_returns_tuple(self) -> bool:
-        return self.method not in ("mtp", "draft_model")
+        return self.method not in ("mtp", "draft_model", "cascade")
 
     def prepare_next_token_ids_cpu(
         self,

@@ -48,6 +48,7 @@ SpeculativeMethod = Literal[
     "medusa",
     "mlp_speculator",
     "draft_model",
+    "cascade",
     "suffix",
     EagleModelTypes,
 ]
@@ -125,6 +126,13 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+
+    # Cascade speculative decoding configuration
+    cascade_deferral_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Alpha threshold for Chow's deferral rule in cascade speculative
+    decoding. Defer to target model when max_v q(v) < 1 - alpha. Higher
+    alpha means more tokens are auto-accepted by the draft model (faster
+    but potentially lower quality). Only used when method is 'cascade'."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -425,6 +433,8 @@ class SpeculativeConfig:
                         )
                 elif self.method == "draft_model":
                     pass
+                elif self.method == "cascade":
+                    pass  # Cascade uses draft model infrastructure
                 else:
                     raise NotImplementedError(
                         f"Unsupported speculative method: '{self.method}'"
@@ -712,7 +722,7 @@ class SpeculativeConfig:
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
-            self.method == "draft_model"
+            self.method in ("draft_model", "cascade")
             and self.target_model_config is not None
             and self.draft_model_config is not None
         ):
@@ -732,6 +742,9 @@ class SpeculativeConfig:
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
+
+    def uses_cascade(self) -> bool:
+        return self.method == "cascade"
 
     def __repr__(self) -> str:
         method = self.method
